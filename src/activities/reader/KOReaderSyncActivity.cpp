@@ -32,6 +32,9 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/WifiUtils.h"
+#include "GlobalActions.h"
+#include "presence/PresenceAuto.h"
+#include "presence/PresenceStore.h"
 
 namespace {
 constexpr int RESULT_NON_TOUCH_ACTION_HEIGHT = 40;
@@ -250,7 +253,16 @@ void KOReaderSyncActivity::saveProgressAndReturn(const CrossPointPosition& posit
   returnToReader();
 }
 
-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath, false, false, true); }
+void KOReaderSyncActivity::returnToReader() {
+  if (PresenceAuto::sleepAfterSync) {
+    // Pre-sleep push finished (or failed quietly): finish going to sleep.
+    PresenceAuto::sleepAfterSync = false;
+    wifiOff();
+    enterDeepSleep(false);
+    return;
+  }
+  activityManager.goToReader(epubPath, false, false, true);
+}
 
 bool KOReaderSyncActivity::consumeInitialConfirmRelease() {
   if (!lockInitialConfirmRelease) {
@@ -265,7 +277,8 @@ bool KOReaderSyncActivity::consumeInitialConfirmRelease() {
 }
 
 bool KOReaderSyncActivity::smartSyncEnabled() const {
-  return KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
+  // Automatic Presence syncs never stop to ask: they always use smart rules.
+  return PresenceAuto::unattended || KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
 }
 
 void KOReaderSyncActivity::markAutoReturn() { autoReturnAt = millis() + AUTO_RETURN_DELAY_MS; }
@@ -288,6 +301,7 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 
   WiFi.setSleep(false);
   LOG_DBG("KOSync", "WiFi sleep disabled for sync");
+  if (PRESENCE.configured()) PRESENCE.markWifiOk();  // a known network was in range
 
   sdFontSystem.releaseForNetwork(renderer);
 
@@ -300,6 +314,12 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 
   // Sync time with NTP before making API requests
   syncTimeWithNTP();
+
+  // Presence fork: refresh Presence items on the same Wi-Fi session. Skipped
+  // before sleep, where only the page position matters.
+  if (!PresenceAuto::sleepAfterSync && (PRESENCE.configured() || PRESENCE.loadConfig())) {
+    if (!PRESENCE.syncNow()) LOG_ERR("PRES", "Presence items did not sync; keeping the last copy");
+  }
 
   {
     RenderLock lock(*this);
@@ -657,7 +677,9 @@ void KOReaderSyncActivity::onEnter() {
     if (hasReaderOrientation) ReaderUtils::applyOrientation(renderer, readerOrientation);
     // Zero means no reader override; valid orientations are encoded one-based.
     const uint32_t orientationPayload = hasReaderOrientation ? static_cast<uint32_t>(readerOrientation) + 1 : 0;
-    silentRestartToNetwork(NetworkBootTarget::KOREADER_SYNC, orientationPayload);
+    const uint32_t presenceFlags = PresenceAuto::pendingHandoffFlags;
+    PresenceAuto::pendingHandoffFlags = 0;
+    silentRestartToNetwork(NetworkBootTarget::KOREADER_SYNC, orientationPayload | presenceFlags);
     return;
   }
 
@@ -701,7 +723,8 @@ void KOReaderSyncActivity::onEnter() {
   // Launch WiFi selection subactivity
   LOG_INF("KOSync", "launch WiFi selection free=%u maxAlloc=%u stack=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
           static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, true, true),
+  startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, true, true,
+                                                                PresenceAuto::unattended),
                          [this](const ActivityResult& result) { onWifiSelectionComplete(!result.isCancelled); });
 }
 
@@ -864,6 +887,11 @@ void KOReaderSyncActivity::loop() {
   }
 
   if (state == NO_CREDENTIALS || state == SYNC_FAILED || state == UPLOAD_COMPLETE || state == SYNC_COMPLETE) {
+    if (PresenceAuto::unattended && (state == NO_CREDENTIALS || state == SYNC_FAILED)) {
+      LOG_INF("KOSync", "Automatic sync could not finish; opening the book as it was");
+      returnToReader();
+      return;
+    }
     if (autoReturnAt != 0 && millis() >= autoReturnAt) {
       returnToReader();
       return;

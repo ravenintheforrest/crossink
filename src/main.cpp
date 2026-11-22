@@ -90,6 +90,9 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
+#include "activities/network/PresenceSyncActivity.h"
+#include "presence/PresenceAuto.h"
+#include "presence/PresenceStore.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/boot_sleep/ImageFolderIndex.h"
@@ -477,7 +480,8 @@ static uint32_t encodeKOReaderSyncOrientation(const uint8_t orientation) {
   return orientation < CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint32_t>(orientation) + 1 : 0;
 }
 
-static uint8_t decodeKOReaderSyncOrientation(const uint32_t payload) {
+static uint8_t decodeKOReaderSyncOrientation(uint32_t payload) {
+  payload &= ~PresenceAuto::PAYLOAD_FLAGS;
   return payload > 0 && payload <= CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint8_t>(payload - 1)
                                                                          : CrossPointSettings::ORIENTATION_COUNT;
 }
@@ -1085,6 +1089,23 @@ void mirrorWakeShortPressToNvs() {
 
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout) {
+  // Presence fork: before sleeping from a book, push its page so the phone and
+  // web open where the reader stopped. The reader's onExit saves progress,
+  // then a quiet network boot uploads it and calls back here to sleep.
+  static bool presencePushStarted = false;
+  if (!deepSleepInProgress && !presencePushStarted && !PresenceAuto::sleepAfterSync &&
+      activityManager.isReaderActivity() && FsHelpers::hasEpubExtension(APP_STATE.openEpubPath) &&
+      PRESENCE.loadConfig() && KOREADER_STORE.hasCredentials() && !PRESENCE.recentlyFailed(10)) {
+    auto handoff = makeUniqueNoThrow<KOReaderSyncActivity>(renderer, mappedInputManager, SETTINGS.orientation);
+    if (handoff) {
+      presencePushStarted = true;
+      PRESENCE.markAttempt();
+      PresenceAuto::pendingHandoffFlags = PresenceAuto::PAYLOAD_AUTO | PresenceAuto::PAYLOAD_SLEEP_AFTER;
+      LOG_INF("PRES", "Pushing the page before sleep");
+      activityManager.replaceActivity(std::move(handoff));
+      return;
+    }
+  }
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
@@ -1358,9 +1379,9 @@ void setup() {
   if (!isNetworkResume) {
     Dictionary::isValidDictionary();
   } else if (snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::KOREADER_SYNC) ||
+             snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::PRESENCE_SYNC) ||
              snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::KOREADER_AUTH) ||
              snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::FILE_TRANSFER)) {
-    KOREADER_STORE.loadFromFile();
   }
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
@@ -1495,6 +1516,28 @@ void setup() {
       break;
   }
 
+  // Presence fork: sync on its own when the reader wakes. A book that was open
+  // runs KOReader smart sync (which also refreshes Presence items) and opens
+  // at the newest page; otherwise only Presence items are fetched for Home.
+  // Both steps join saved Wi-Fi without asking and give up quietly.
+  if (isSleepWake && !isSilentReboot && !recoveryFirmwareMode && !rebootedFromPanic && PRESENCE.loadConfig() &&
+      PRESENCE.autoSyncDue(PresenceAuto::WAKE_SYNC_MIN_MINUTES) &&
+      !mappedInputManager.isPressed(MappedInputManager::Button::Back)) {
+    const bool resumesBook = !APP_STATE.openEpubPath.empty() && APP_STATE.lastSleepFromReader &&
+                             APP_STATE.readerActivityLoadCount == 0 &&
+                             FsHelpers::hasEpubExtension(APP_STATE.openEpubPath) &&
+                             Storage.exists(APP_STATE.openEpubPath.c_str());
+    if (resumesBook && KOREADER_STORE.hasCredentials()) {
+      LOG_INF("PRES", "Wake sync: KOReader smart sync for the open book");
+      PRESENCE.markAttempt();
+      silentRestartToNetwork(NetworkBootTarget::KOREADER_SYNC, PresenceAuto::PAYLOAD_AUTO);
+    } else if (!resumesBook && PRESENCE.presenceHomeEnabled()) {
+      LOG_INF("PRES", "Wake sync: Presence items for Home");
+      PRESENCE.markAttempt();
+      silentRestartToNetwork(NetworkBootTarget::PRESENCE_SYNC);
+    }
+  }
+
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
     activityManager.replaceActivity(
@@ -1520,8 +1563,26 @@ void setup() {
         launched = activityManager.goToOpdsServer(snapshotPayload, true);
         break;
       case NetworkBootTarget::KOREADER_SYNC:
+        PresenceAuto::unattended = (snapshotPayload & PresenceAuto::PAYLOAD_AUTO) != 0;
+        PresenceAuto::sleepAfterSync = (snapshotPayload & PresenceAuto::PAYLOAD_SLEEP_AFTER) != 0;
         launched = startGlobalSyncProgress(true, decodeKOReaderSyncOrientation(snapshotPayload));
+        if (!launched && PresenceAuto::sleepAfterSync) {
+          PresenceAuto::sleepAfterSync = false;
+          enterDeepSleep(false);
+        }
         break;
+      case NetworkBootTarget::PRESENCE_SYNC: {
+        PresenceAuto::unattended = true;
+        auto presenceActivity = makeUniqueNoThrow<PresenceSyncActivity>(renderer, mappedInputManager);
+        if (presenceActivity) {
+          activityManager.replaceActivity(std::move(presenceActivity));
+          launched = true;
+        } else {
+          LOG_ERR("MAIN", "OOM: Presence sync activity after minimal boot (free=%u maxAlloc=%u)", ESP.getFreeHeap(),
+                  ESP.getMaxAllocHeap());
+        }
+        break;
+      }
       case NetworkBootTarget::KOREADER_AUTH: {
         const auto mode =
             snapshotPayload == 1 ? KOReaderAuthActivity::Mode::SIGN_UP : KOReaderAuthActivity::Mode::AUTHENTICATE;
