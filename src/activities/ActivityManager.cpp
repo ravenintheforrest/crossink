@@ -29,6 +29,8 @@
 #include "home/CrashActivity.h"
 #include "home/FileBrowserActivity.h"
 #include "home/HomeActivity.h"
+#include "home/PresenceHomeActivity.h"
+#include "presence/PresenceStore.h"
 #include "home/RecentBookProgress.h"
 #include "library/LibraryActivity.h"
 #include "network/CrossPointWebServerActivity.h"
@@ -1074,6 +1076,12 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem, const HalDisplay::Ref
     } else if (activityName == "Settings") {
       initialMenuItem = HomeMenuItem::SETTINGS_MENU;
     }
+  }
+  // Presence fork: the Presence Home replaces the classic one once
+  // /Presence/config.txt exists (home=classic in that file switches back).
+  if (PRESENCE.loadConfig() && PRESENCE.presenceHomeEnabled()) {
+    replaceActivity(std::make_unique<PresenceHomeActivity>(renderer, mappedInput));
+    return;
   }
   replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem, initialRefreshMode,
                                                  std::move(initialBookPath)));

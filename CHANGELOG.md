@@ -1,3 +1,16 @@
+## [Unreleased] - Presence fork
+
+### Added
+
+- Presence Home: a calmer home screen with the book you are reading, today's Bible chapter, the latest briefing and the notes you marked for paper, plus Library, Sync now and Settings. Turn it on with `/Presence/config.txt` (`server=`, `token=`); `home=classic` keeps the old Home.
+- Automatic sync on wake: after 3 minutes or more asleep, the reader joins saved Wi-Fi on its own, pulls your newest page from KOReader sync and refreshes Presence items, then opens the book. Hold Back while waking to skip it.
+- Sync before reading: opening the current book from Presence Home pulls the newest page first when the last sync is old.
+- Push before sleep: going to sleep from a book uploads the page first, so the phone and web open where you stopped.
+
+### Changed
+
+- Unattended syncs never show the Wi-Fi list. When no saved network is in range they give up quietly and wait 10 minutes before trying again.
+
 ## [v1.6.1] - 2026-10-03
 
 ### Added

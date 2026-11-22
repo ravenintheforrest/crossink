@@ -91,6 +91,7 @@ class WifiSelectionActivity final : public Activity {
   // Reader flows keep the reader orientation while WiFi is selected. Button
   // hint text needs the same inverted portrait treatment in that context.
   const bool useReaderButtonHints;
+  const bool unattended;
 
   // Whether we are attempting to auto-connect or auto-scan saved networks.
   bool autoConnecting = false;
@@ -158,8 +159,10 @@ class WifiSelectionActivity final : public Activity {
   void onComplete(bool connected);
 
  public:
+  // unattended (Presence fork): for automatic syncs. When no saved network
+  // connects, finish as cancelled instead of showing the network list.
   explicit WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool autoConnect = true,
-                                 bool useReaderButtonHints = false);
+                                 bool useReaderButtonHints = false, bool unattended = false);
   void onEnter() override;
   void onExit() override;
   void loop() override;

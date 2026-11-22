@@ -185,10 +185,12 @@ const char* wifiAuthName(const int authMode) {
 }  // namespace
 
 WifiSelectionActivity::WifiSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                             const bool autoConnect, const bool useReaderButtonHints)
+                                             const bool autoConnect, const bool useReaderButtonHints,
+                                             const bool unattended)
     : Activity("WifiSelection", renderer, mappedInput),
       allowAutoConnect(autoConnect),
       useReaderButtonHints(useReaderButtonHints),
+      unattended(unattended),
       uiTarget(makeUiTarget(renderer)),
       app(uiTarget, uiTarget.deviceContext()) {}
 
@@ -442,6 +444,12 @@ void WifiSelectionActivity::processWifiScanResults() {
     return;
   }
 
+  if (unattended) {
+    LOG_INF("WIFI", "Unattended: no saved network connected; giving up quietly");
+    onComplete(false);
+    return;
+  }
+
   autoConnecting = false;
   manualNetworkListRequested = false;
   releaseWifiForNetworkList();
@@ -616,6 +624,10 @@ void WifiSelectionActivity::handleAutoConnectFailure() {
 
   if (!networks.empty()) {
     if (tryNextSavedNetworkFromScan()) {
+      return;
+    }
+    if (unattended) {
+      onComplete(false);
       return;
     }
     autoConnecting = false;
